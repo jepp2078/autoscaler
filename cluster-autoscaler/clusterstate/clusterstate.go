@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/golang/glog"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/rancher"
 )
 
 const (
@@ -894,7 +895,13 @@ func (csr *ClusterStateRegistry) GetUpcomingNodes() map[string]int {
 func getNotRegisteredNodes(allNodes []*apiv1.Node, cloudProvider cloudprovider.CloudProvider, time time.Time) ([]UnregisteredNode, error) {
 	registered := sets.NewString()
 	for _, node := range allNodes {
-		registered.Insert(node.Spec.ProviderID)
+		//TODO(Jepp2078): This is needed because Rancher doesn't fill out node.Spec.ProviderID.
+		// This can in theory result in node duplicates, but Rancher doesn't allow node name duplicates across or in node-pools.
+		if cloudProvider.Name() == rancher.ProviderName{
+			registered.Insert(node.Name)
+		}else{
+			registered.Insert(node.Spec.ProviderID)
+		}
 	}
 	notRegistered := make([]UnregisteredNode, 0)
 	for _, nodeGroup := range cloudProvider.NodeGroups() {
