@@ -31,12 +31,11 @@ func (rancher *RancherCloudProvider) Name() string { return ProviderName }
 
 func (rancher *RancherCloudProvider) NodeGroups() []cloudprovider.NodeGroup {
 	nodePools := rancher.rancherManager.getNodePools()
-	nps := make([]cloudprovider.NodeGroup, len(nodePools))
+	ngs := make([]cloudprovider.NodeGroup, len(nodePools))
 	for i, nodePool := range nodePools {
-		nps[i] = nodePool
+		ngs[i] = nodePool
 	}
-	return nps
-	return []cloudprovider.NodeGroup{}
+	return ngs
 }
 
 func (rancher *RancherCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.NodeGroup, error) {
