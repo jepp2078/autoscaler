@@ -78,8 +78,16 @@ var (
 		},
 		"nvidia-tesla-v100": {
 			1: 12,
+			2: 24,
+			4: 48,
 			8: 96,
 		},
+	}
+
+	supportedGpuTypes = []string{
+		"nvidia-tesla-k80",
+		"nvidia-tesla-p100",
+		"nvidia-tesla-v100",
 	}
 )
 

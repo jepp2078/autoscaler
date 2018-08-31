@@ -29,13 +29,26 @@ type ScaleUpStatus struct {
 	ScaledUp                bool
 	ScaleUpInfos            []nodegroupset.ScaleUpInfo
 	PodsTriggeredScaleUp    []*apiv1.Pod
-	PodsRemainUnschedulable []*apiv1.Pod
+	PodsRemainUnschedulable []NoScaleUpInfo
 	PodsAwaitEvaluation     []*apiv1.Pod
+}
+
+// NoScaleUpInfo contains information about a pod that didn't trigger scale-up.
+type NoScaleUpInfo struct {
+	Pod                *apiv1.Pod
+	RejectedNodeGroups map[string]Reasons
+	SkippedNodeGroups  map[string]Reasons
+}
+
+// Reasons interface provides a list of reasons for why something happened or didn't happen.
+type Reasons interface {
+	Reasons() []string
 }
 
 // ScaleUpStatusProcessor processes the status of the cluster after a scale-up.
 type ScaleUpStatusProcessor interface {
 	Process(context *context.AutoscalingContext, status *ScaleUpStatus)
+	CleanUp()
 }
 
 // NewDefaultScaleUpStatusProcessor creates a default instance of ScaleUpStatusProcessor.
@@ -48,4 +61,8 @@ type NoOpScaleUpStatusProcessor struct{}
 
 // Process processes the status of the cluster after a scale-up.
 func (p *NoOpScaleUpStatusProcessor) Process(context *context.AutoscalingContext, status *ScaleUpStatus) {
+}
+
+// CleanUp cleans up the processor's internal structures.
+func (p *NoOpScaleUpStatusProcessor) CleanUp() {
 }

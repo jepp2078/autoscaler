@@ -17,15 +17,12 @@ limitations under the License.
 package context
 
 import (
-	"time"
-
+	"github.com/golang/glog"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/builder"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate/utils"
+	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/expander"
-	"k8s.io/autoscaler/cluster-autoscaler/expander/factory"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
-	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	kube_client "k8s.io/client-go/kubernetes"
 	kube_record "k8s.io/client-go/tools/record"
@@ -35,120 +32,34 @@ import (
 // scale up/scale down functions.
 type AutoscalingContext struct {
 	// Options to customize how autoscaling works
-	AutoscalingOptions
+	config.AutoscalingOptions
+	// Kubernetes API clients.
+	AutoscalingKubeClients
 	// CloudProvider used in CA.
 	CloudProvider cloudprovider.CloudProvider
-	// ClientSet interface.
-	ClientSet kube_client.Interface
-	// Recorder for recording events.
-	Recorder kube_record.EventRecorder
 	// TODO(kgolab) - move away too as it's not config
 	// PredicateChecker to check if a pod can fit into a node.
 	PredicateChecker *simulator.PredicateChecker
 	// ExpanderStrategy is the strategy used to choose which node group to expand when scaling up
 	ExpanderStrategy expander.Strategy
+}
+
+// AutoscalingKubeClients contains all Kubernetes API clients,
+// including listers and event recorders.
+type AutoscalingKubeClients struct {
+	// Listers.
+	kube_util.ListerRegistry
+	// ClientSet interface.
+	ClientSet kube_client.Interface
+	// Recorder for recording events.
+	Recorder kube_record.EventRecorder
 	// LogRecorder can be used to collect log messages to expose via Events on some central object.
 	LogRecorder *utils.LogEventRecorder
 }
 
-// GpuLimits define lower and upper bound on GPU instances of given type in cluster
-type GpuLimits struct {
-	// Type of the GPU (e.g. nvidia-tesla-k80)
-	GpuType string
-	// Lower bound on number of GPUs of given type in cluster
-	Min int64
-	// Upper bound on number of GPUs of given type in cluster
-	Max int64
-}
-
-// AutoscalingOptions contain various options to customize how autoscaling works
-type AutoscalingOptions struct {
-	// MaxEmptyBulkDelete is a number of empty nodes that can be removed at the same time.
-	MaxEmptyBulkDelete int
-	// ScaleDownUtilizationThreshold sets threshold for nodes to be considered for scale down.
-	// Well-utilized nodes are not touched.
-	ScaleDownUtilizationThreshold float64
-	// ScaleDownUnneededTime sets the duration CA expects a node to be unneeded/eligible for removal
-	// before scaling down the node.
-	ScaleDownUnneededTime time.Duration
-	// ScaleDownUnreadyTime represents how long an unready node should be unneeded before it is eligible for scale down
-	ScaleDownUnreadyTime time.Duration
-	// MaxNodesTotal sets the maximum number of nodes in the whole cluster
-	MaxNodesTotal int
-	// MaxCoresTotal sets the maximum number of cores in the whole cluster
-	MaxCoresTotal int64
-	// MinCoresTotal sets the minimum number of cores in the whole cluster
-	MinCoresTotal int64
-	// MaxMemoryTotal sets the maximum memory (in bytes) in the whole cluster
-	MaxMemoryTotal int64
-	// MinMemoryTotal sets the maximum memory (in bytes) in the whole cluster
-	MinMemoryTotal int64
-	// GpuTotal is a list of strings with configuration of min/max limits for different GPUs.
-	GpuTotal []GpuLimits
-	// NodeGroupAutoDiscovery represents one or more definition(s) of node group auto-discovery
-	NodeGroupAutoDiscovery []string
-	// EstimatorName is the estimator used to estimate the number of needed nodes in scale up.
-	EstimatorName string
-	// ExpanderName sets the type of node group expander to be used in scale up
-	ExpanderName string
-	// MaxGracefulTerminationSec is maximum number of seconds scale down waits for pods to terminate before
-	// removing the node from cloud provider.
-	MaxGracefulTerminationSec int
-	//  Maximum time CA waits for node to be provisioned
-	MaxNodeProvisionTime time.Duration
-	// MaxTotalUnreadyPercentage is the maximum percentage of unready nodes after which CA halts operations
-	MaxTotalUnreadyPercentage float64
-	// OkTotalUnreadyCount is the number of allowed unready nodes, irrespective of max-total-unready-percentage
-	OkTotalUnreadyCount int
-	// CloudConfig is the path to the cloud provider configuration file. Empty string for no configuration file.
-	CloudConfig string
-	// CloudProviderName sets the type of the cloud provider CA is about to run in. Allowed values: gce, aws
-	CloudProviderName string
-	// NodeGroups is the list of node groups a.k.a autoscaling targets
-	NodeGroups []string
-	// ScaleDownEnabled is used to allow CA to scale down the cluster
-	ScaleDownEnabled bool
-	// ScaleDownDelayAfterAdd sets the duration from the last scale up to the time when CA starts to check scale down options
-	ScaleDownDelayAfterAdd time.Duration
-	// ScaleDownDelayAfterDelete sets the duration between scale down attempts if scale down removes one or more nodes
-	ScaleDownDelayAfterDelete time.Duration
-	// ScaleDownDelayAfterFailure sets the duration before the next scale down attempt if scale down results in an error
-	ScaleDownDelayAfterFailure time.Duration
-	// ScaleDownNonEmptyCandidatesCount is the maximum number of non empty nodes
-	// considered at once as candidates for scale down.
-	ScaleDownNonEmptyCandidatesCount int
-	// ScaleDownCandidatesPoolRatio is a ratio of nodes that are considered
-	// as additional non empty candidates for scale down when some candidates from
-	// previous iteration are no longer valid.
-	ScaleDownCandidatesPoolRatio float64
-	// ScaleDownCandidatesPoolMinCount is the minimum number of nodes that are
-	// considered as additional non empty candidates for scale down when some
-	// candidates from previous iteration are no longer valid.
-	// The formula to calculate additional candidates number is following:
-	// max(#nodes * ScaleDownCandidatesPoolRatio, ScaleDownCandidatesPoolMinCount)
-	ScaleDownCandidatesPoolMinCount int
-	// WriteStatusConfigMap tells if the status information should be written to a ConfigMap
-	WriteStatusConfigMap bool
-	// BalanceSimilarNodeGroups enables logic that identifies node groups with similar machines and tries to balance node count between them.
-	BalanceSimilarNodeGroups bool
-	// ConfigNamespace is the namespace cluster-autoscaler is running in and all related configmaps live in
-	ConfigNamespace string
-	// ClusterName if available
-	ClusterName string
-	// NodeAutoprovisioningEnabled tells whether the node auto-provisioning is enabled for this cluster.
-	NodeAutoprovisioningEnabled bool
-	// MaxAutoprovisionedNodeGroupCount is the maximum number of autoprovisioned groups in the cluster.
-	MaxAutoprovisionedNodeGroupCount int
-	// Pods with priority below cutoff are expendable. They can be killed without any consideration during scale down and they don't cause scale-up.
-	// Pods with null priority (PodPriority disabled) are non-expendable.
-	ExpendablePodsPriorityCutoff int
-	// Regional tells whether the cluster is regional.
-	Regional bool
-}
-
 // NewResourceLimiterFromAutoscalingOptions creates new instance of cloudprovider.ResourceLimiter
 // reading limits from AutoscalingOptions struct.
-func NewResourceLimiterFromAutoscalingOptions(options AutoscalingOptions) *cloudprovider.ResourceLimiter {
+func NewResourceLimiterFromAutoscalingOptions(options config.AutoscalingOptions) *cloudprovider.ResourceLimiter {
 	// build min/max maps for resources limits
 	minResources := make(map[string]int64)
 	maxResources := make(map[string]int64)
@@ -166,30 +77,34 @@ func NewResourceLimiterFromAutoscalingOptions(options AutoscalingOptions) *cloud
 }
 
 // NewAutoscalingContext returns an autoscaling context from all the necessary parameters passed via arguments
-func NewAutoscalingContext(options AutoscalingOptions, predicateChecker *simulator.PredicateChecker,
-	kubeClient kube_client.Interface, kubeEventRecorder kube_record.EventRecorder,
-	logEventRecorder *utils.LogEventRecorder, listerRegistry kube_util.ListerRegistry) (*AutoscalingContext, errors.AutoscalerError) {
+func NewAutoscalingContext(options config.AutoscalingOptions, predicateChecker *simulator.PredicateChecker,
+	autoscalingKubeClients *AutoscalingKubeClients, cloudProvider cloudprovider.CloudProvider, expanderStrategy expander.Strategy) *AutoscalingContext {
+	return &AutoscalingContext{
+		AutoscalingOptions:     options,
+		CloudProvider:          cloudProvider,
+		AutoscalingKubeClients: *autoscalingKubeClients,
+		PredicateChecker:       predicateChecker,
+		ExpanderStrategy:       expanderStrategy,
+	}
+}
 
-	cloudProviderBuilder := builder.NewCloudProviderBuilder(options.CloudProviderName, options.CloudConfig, options.ClusterName, options.NodeAutoprovisioningEnabled, options.Regional)
-	cloudProvider := cloudProviderBuilder.Build(cloudprovider.NodeGroupDiscoveryOptions{
-		NodeGroupSpecs:              options.NodeGroups,
-		NodeGroupAutoDiscoverySpecs: options.NodeGroupAutoDiscovery},
-		NewResourceLimiterFromAutoscalingOptions(options))
-	expanderStrategy, err := factory.ExpanderStrategyFromString(options.ExpanderName,
-		cloudProvider, listerRegistry.AllNodeLister())
+// NewAutoscalingKubeClients builds AutoscalingKubeClients out of basic client.
+func NewAutoscalingKubeClients(opts config.AutoscalingOptions, kubeClient kube_client.Interface) *AutoscalingKubeClients {
+	listerRegistryStopChannel := make(chan struct{})
+	listerRegistry := kube_util.NewListerRegistryWithDefaultListers(kubeClient, listerRegistryStopChannel)
+	kubeEventRecorder := kube_util.CreateEventRecorder(kubeClient)
+	logRecorder, err := utils.NewStatusMapRecorder(kubeClient, opts.ConfigNamespace, kubeEventRecorder, opts.WriteStatusConfigMap)
 	if err != nil {
-		return nil, err
+		glog.Error("Failed to initialize status configmap, unable to write status events")
+		// Get a dummy, so we can at least safely call the methods
+		// TODO(maciekpytel): recover from this after successful status configmap update?
+		logRecorder, _ = utils.NewStatusMapRecorder(kubeClient, opts.ConfigNamespace, kubeEventRecorder, false)
 	}
 
-	autoscalingContext := AutoscalingContext{
-		AutoscalingOptions: options,
-		CloudProvider:      cloudProvider,
-		ClientSet:          kubeClient,
-		Recorder:           kubeEventRecorder,
-		PredicateChecker:   predicateChecker,
-		ExpanderStrategy:   expanderStrategy,
-		LogRecorder:        logEventRecorder,
+	return &AutoscalingKubeClients{
+		ListerRegistry: listerRegistry,
+		ClientSet:      kubeClient,
+		Recorder:       kubeEventRecorder,
+		LogRecorder:    logRecorder,
 	}
-
-	return &autoscalingContext, nil
 }

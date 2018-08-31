@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/golang/glog"
+
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	labels "k8s.io/apimachinery/pkg/labels"
@@ -91,7 +93,7 @@ type ContainerUsageSampleWithKey struct {
 	Container ContainerID
 }
 
-// AddOrUpdatePod udpates the state of the pod with a given PodID, if it is
+// AddOrUpdatePod updates the state of the pod with a given PodID, if it is
 // present in the cluster object. Otherwise a new pod is created and added to
 // the Cluster object.
 // If the labels of the pod have changed, it updates the links between the containers
@@ -142,8 +144,8 @@ func (cluster *ClusterState) AddOrUpdateContainer(containerID ContainerID, reque
 		return NewKeyError(containerID.PodID)
 	}
 	if container, containerExists := pod.Containers[containerID.ContainerName]; !containerExists {
-		aggregateContainerState := cluster.findOrCreateAggregateContainerState(containerID)
-		pod.Containers[containerID.ContainerName] = NewContainerState(request, aggregateContainerState)
+		cluster.findOrCreateAggregateContainerState(containerID)
+		pod.Containers[containerID.ContainerName] = NewContainerState(request, NewContainerStateAggregatorProxy(cluster, containerID))
 	} else {
 		// Container aleady exists. Possibly update the request.
 		container.Request = request
@@ -198,12 +200,11 @@ func (cluster *ClusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 	}
 	var currentRecommendation *vpa_types.RecommendedPodResources
 	if conditionsMap[vpa_types.RecommendationProvided].Status == apiv1.ConditionTrue {
-		currentRecommendation = &apiObject.Status.Recommendation
+		currentRecommendation = apiObject.Status.Recommendation
 	}
 	selector, err := metav1.LabelSelectorAsSelector(apiObject.Spec.Selector)
 	if err != nil {
-		errMsg := fmt.Sprintf("couldn't convert selector into a corresponding internal selector object: %v", err)
-		conditionsMap.Set(vpa_types.Configured, false, "InvalidSelector", errMsg)
+		return err
 	}
 
 	vpa, vpaExists := cluster.Vpas[vpaID]
@@ -216,7 +217,7 @@ func (cluster *ClusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 		vpaExists = false
 	}
 	if !vpaExists {
-		vpa = NewVpa(vpaID, selector)
+		vpa = NewVpa(vpaID, selector, apiObject.CreationTimestamp.Time)
 		cluster.Vpas[vpaID] = vpa
 		for aggregationKey, aggregation := range cluster.aggregateStateMap {
 			vpa.UseAggregationIfMatching(aggregationKey, aggregation)
@@ -224,8 +225,10 @@ func (cluster *ClusterState) AddOrUpdateVpa(apiObject *vpa_types.VerticalPodAuto
 	}
 	vpa.Conditions = conditionsMap
 	vpa.Recommendation = currentRecommendation
-	vpa.ResourcePolicy = &apiObject.Spec.ResourcePolicy
-	vpa.LastUpdateTime = apiObject.Status.LastUpdateTime.Time
+	vpa.ResourcePolicy = apiObject.Spec.ResourcePolicy
+	if apiObject.Spec.UpdatePolicy != nil {
+		vpa.UpdateMode = apiObject.Spec.UpdatePolicy.UpdateMode
+	}
 	return nil
 }
 
@@ -289,6 +292,24 @@ func (cluster *ClusterState) findOrCreateAggregateContainerState(containerID Con
 		}
 	}
 	return aggregateContainerState
+}
+
+// GarbageCollectAggregateCollectionStates removes obsolete AggregateCollectionStates from the ClusterState.
+func (cluster *ClusterState) GarbageCollectAggregateCollectionStates(now time.Time) {
+	glog.V(1).Info("Garbage collection of AggregateCollectionStates triggered")
+	keysToDelete := make([]AggregateStateKey, 0)
+	for key, aggregateContainerState := range cluster.aggregateStateMap {
+		if aggregateContainerState.isExpired(now) {
+			keysToDelete = append(keysToDelete, key)
+			glog.V(1).Info("Removing AggregateCollectionStates for %+v", key)
+		}
+	}
+	for _, key := range keysToDelete {
+		delete(cluster.aggregateStateMap, key)
+		for _, vpa := range cluster.Vpas {
+			vpa.DeleteAggregation(key)
+		}
+	}
 }
 
 // Implementation of the AggregateStateKey interface. It can be used as a map key.

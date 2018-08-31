@@ -17,6 +17,7 @@ limitations under the License.
 package priority
 
 import (
+	"flag"
 	"math"
 	"sort"
 	"time"
@@ -35,6 +36,12 @@ const (
 	podLifetimeUpdateThreshold = time.Hour * 12
 )
 
+var (
+	evictAfterOOMThreshold = flag.Duration("evict-after-oom-treshold", 10*time.Minute,
+		`Evict pod that has only one container and it OOMed in less than
+		evict-after-oom-treshold since start.`)
+)
+
 // UpdatePriorityCalculator is responsible for prioritizing updates on pods.
 // It can returns a sorted list of pods in order of update priority.
 // Update priority is proportional to fraction by which resources should be increased / decreased.
@@ -42,6 +49,7 @@ const (
 // than pod with 100M current memory and 150M recommendation (100% increase vs 50% increase)
 type UpdatePriorityCalculator struct {
 	resourcesPolicy         *vpa_types.PodResourcePolicy
+	conditions              []vpa_types.VerticalPodAutoscalerCondition
 	pods                    []podPriority
 	config                  *UpdateConfig
 	recommendationProcessor vpa_api_util.RecommendationProcessor
@@ -57,16 +65,19 @@ type UpdateConfig struct {
 // NewUpdatePriorityCalculator creates new UpdatePriorityCalculator for the given resources policy and configuration.
 // If the given policy is nil, there will be no policy restriction on update.
 // If the given config is nil, default values are used.
-func NewUpdatePriorityCalculator(policy *vpa_types.PodResourcePolicy, config *UpdateConfig, processor vpa_api_util.RecommendationProcessor) UpdatePriorityCalculator {
+func NewUpdatePriorityCalculator(policy *vpa_types.PodResourcePolicy,
+	conditions []vpa_types.VerticalPodAutoscalerCondition,
+	config *UpdateConfig,
+	processor vpa_api_util.RecommendationProcessor) UpdatePriorityCalculator {
 	if config == nil {
 		config = &UpdateConfig{MinChangePriority: defaultUpdateThreshold}
 	}
-	return UpdatePriorityCalculator{resourcesPolicy: policy, config: config, recommendationProcessor: processor}
+	return UpdatePriorityCalculator{resourcesPolicy: policy, conditions: conditions, config: config, recommendationProcessor: processor}
 }
 
 // AddPod adds pod to the UpdatePriorityCalculator.
 func (calc *UpdatePriorityCalculator) AddPod(pod *apiv1.Pod, recommendation *vpa_types.RecommendedPodResources, now time.Time) {
-	processedRecommendation, err := calc.recommendationProcessor.Apply(recommendation, calc.resourcesPolicy, pod)
+	processedRecommendation, _, err := calc.recommendationProcessor.Apply(recommendation, calc.resourcesPolicy, calc.conditions, pod)
 	if err != nil {
 		glog.V(2).Infof("cannot process recommendation for pod %s: %v", pod.Name, err)
 		return
@@ -74,10 +85,22 @@ func (calc *UpdatePriorityCalculator) AddPod(pod *apiv1.Pod, recommendation *vpa
 
 	updatePriority := calc.getUpdatePriority(pod, processedRecommendation)
 
-	// The update is allowed in either of the following two cases:
-	// 1. the request is outside the recommended range for some container.
-	// 2. the pod lives for at least 24h and the resource diff is >= MinChangePriority.
-	if !updatePriority.outsideRecommendedRange {
+	quickOOM := false
+	if len(pod.Status.ContainerStatuses) == 1 {
+		terminationState := pod.Status.ContainerStatuses[0].LastTerminationState
+		if terminationState.Terminated != nil &&
+			terminationState.Terminated.Reason == "OOMKilled" &&
+			terminationState.Terminated.FinishedAt.Time.Sub(terminationState.Terminated.StartedAt.Time) < *evictAfterOOMThreshold {
+			quickOOM = true
+			glog.V(2).Infof("quick OOM detected in pod %v", pod.Name)
+		}
+	}
+
+	// The update is allowed in following cases:
+	// - the request is outside the recommended range for some container.
+	// - the pod lives for at least 24h and the resource diff is >= MinChangePriority.
+	// - there is only one container in a pod and it OOMed in less than evictAfterOOMThreshold
+	if !updatePriority.outsideRecommendedRange && !quickOOM {
 		if pod.Status.StartTime == nil {
 			// TODO: Set proper condition on the VPA.
 			glog.V(2).Infof("not updating pod %v, missing field pod.Status.StartTime", pod.Name)
@@ -97,12 +120,16 @@ func (calc *UpdatePriorityCalculator) AddPod(pod *apiv1.Pod, recommendation *vpa
 }
 
 // GetSortedPods returns a list of pods ordered by update priority (highest update priority first)
-func (calc *UpdatePriorityCalculator) GetSortedPods() []*apiv1.Pod {
+func (calc *UpdatePriorityCalculator) GetSortedPods(admission PodEvictionAdmission) []*apiv1.Pod {
 	sort.Sort(byPriority(calc.pods))
 
-	result := make([]*apiv1.Pod, len(calc.pods))
-	for i, podPrio := range calc.pods {
-		result[i] = podPrio.pod
+	result := []*apiv1.Pod{}
+	for _, podPrio := range calc.pods {
+		if admission == nil || admission.Admit(podPrio.pod, podPrio.recommendation) {
+			result = append(result, podPrio.pod)
+		} else {
+			glog.V(2).Infof("pod removed from update queue by PodEvictionAdmission: %v", podPrio.pod.Name)
+		}
 	}
 
 	return result
@@ -118,17 +145,20 @@ func (calc *UpdatePriorityCalculator) getUpdatePriority(pod *apiv1.Pod, recommen
 
 	for _, podContainer := range pod.Spec.Containers {
 		recommendedRequest := vpa_api_util.GetRecommendationForContainer(podContainer.Name, recommendation)
+		if recommendedRequest == nil {
+			continue
+		}
 		for resourceName, recommended := range recommendedRequest.Target {
 			totalRecommendedPerResource[resourceName] += recommended.MilliValue()
-			minRecommneded, hasMin := recommendedRequest.MinRecommended[resourceName]
-			maxRecommneded, hasMax := recommendedRequest.MaxRecommended[resourceName]
+			lowerBound, hasLowerBound := recommendedRequest.LowerBound[resourceName]
+			upperBound, hasUpperBound := recommendedRequest.UpperBound[resourceName]
 			if request, hasRequest := podContainer.Resources.Requests[resourceName]; hasRequest {
 				totalRequestPerResource[resourceName] += request.MilliValue()
 				if recommended.MilliValue() > request.MilliValue() {
 					scaleUp = true
 				}
-				if (hasMin && request.MilliValue() < minRecommneded.MilliValue()) ||
-					(hasMax && request.MilliValue() > maxRecommneded.MilliValue()) {
+				if (hasLowerBound && request.Cmp(lowerBound) < 0) ||
+					(hasUpperBound && request.Cmp(upperBound) > 0) {
 					outsideRecommendedRange = true
 				}
 			} else {
@@ -151,6 +181,7 @@ func (calc *UpdatePriorityCalculator) getUpdatePriority(pod *apiv1.Pod, recommen
 		outsideRecommendedRange: outsideRecommendedRange,
 		scaleUp:                 scaleUp,
 		resourceDiff:            resourceDiff,
+		recommendation:          recommendation,
 	}
 }
 
@@ -162,6 +193,8 @@ type podPriority struct {
 	scaleUp bool
 	// Relative difference between the total requested and total recommended resources.
 	resourceDiff float64
+	// Recommendation for pod
+	recommendation *vpa_types.RecommendedPodResources
 }
 
 type byPriority []podPriority

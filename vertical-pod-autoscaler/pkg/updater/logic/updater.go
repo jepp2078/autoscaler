@@ -28,6 +28,7 @@ import (
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/poc.autoscaling.k8s.io/v1alpha1"
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
 	vpa_lister "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/listers/poc.autoscaling.k8s.io/v1alpha1"
+	metrics_updater "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/updater"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
 	kube_client "k8s.io/client-go/kubernetes"
 	v1lister "k8s.io/client-go/listers/core/v1"
@@ -47,30 +48,36 @@ type updater struct {
 	podLister               v1lister.PodLister
 	evictionFactory         eviction.PodsEvictionRestrictionFactory
 	recommendationProcessor vpa_api_util.RecommendationProcessor
+	evictionAdmission       priority.PodEvictionAdmission
 }
 
 // NewUpdater creates Updater with given configuration
-func NewUpdater(kubeClient kube_client.Interface, vpaClient *vpa_clientset.Clientset, minReplicasForEvicition int, evictionToleranceFraction float64, recommendationProcessor vpa_api_util.RecommendationProcessor) Updater {
+func NewUpdater(kubeClient kube_client.Interface, vpaClient *vpa_clientset.Clientset, minReplicasForEvicition int, evictionToleranceFraction float64, recommendationProcessor vpa_api_util.RecommendationProcessor, evictionAdmission priority.PodEvictionAdmission) Updater {
 	return &updater{
 		vpaLister:               vpa_api_util.NewAllVpasLister(vpaClient, make(chan struct{})),
 		podLister:               newPodLister(kubeClient),
 		evictionFactory:         eviction.NewPodsEvictionRestrictionFactory(kubeClient, minReplicasForEvicition, evictionToleranceFraction),
 		recommendationProcessor: recommendationProcessor,
+		evictionAdmission:       evictionAdmission,
 	}
 }
 
 // RunOnce represents single iteration in the main-loop of Updater
 func (u *updater) RunOnce() {
+	timer := metrics_updater.NewExecutionTimer()
+
 	vpaList, err := u.vpaLister.List(labels.Everything())
 	if err != nil {
 		glog.Fatalf("failed get VPA list: %v", err)
 	}
+	timer.ObserveStep("ListVPAs")
 
 	vpas := make([]*vpa_types.VerticalPodAutoscaler, 0)
 
 	for _, vpa := range vpaList {
-		if vpa.Spec.UpdatePolicy.UpdateMode != vpa_types.UpdateModeAuto {
-			glog.V(3).Infof("skipping VPA object %v because its mode is not \"Auto\"", vpa.Name)
+		if vpa_api_util.GetUpdateMode(vpa) != vpa_types.UpdateModeRecreate &&
+			vpa_api_util.GetUpdateMode(vpa) != vpa_types.UpdateModeAuto {
+			glog.V(3).Infof("skipping VPA object %v because its mode is not \"Recreate\" or \"Auto\"", vpa.Name)
 			continue
 		}
 		vpas = append(vpas, vpa)
@@ -78,27 +85,39 @@ func (u *updater) RunOnce() {
 
 	if len(vpas) == 0 {
 		glog.Warningf("no VPA objects to process")
+		if u.evictionAdmission != nil {
+			u.evictionAdmission.CleanUp()
+		}
+		timer.ObserveTotal()
 		return
 	}
 
 	podsList, err := u.podLister.List(labels.Everything())
 	if err != nil {
 		glog.Errorf("failed to get pods list: %v", err)
+		timer.ObserveTotal()
 		return
 	}
-	livePods := filterDeletedPods(podsList)
+	timer.ObserveStep("ListPods")
+	allLivePods := filterDeletedPods(podsList)
 
 	controlledPods := make(map[*vpa_types.VerticalPodAutoscaler][]*apiv1.Pod)
-	for _, pod := range livePods {
+	for _, pod := range allLivePods {
 		controllingVPA := vpa_api_util.GetControllingVPAForPod(pod, vpas)
 		if controllingVPA != nil {
 			controlledPods[controllingVPA] = append(controlledPods[controllingVPA], pod)
 		}
 	}
+	timer.ObserveStep("FilterPods")
+
+	if u.evictionAdmission != nil {
+		u.evictionAdmission.LoopInit(allLivePods, controlledPods)
+	}
+	timer.ObserveStep("AdmissionInit")
 
 	for vpa, livePods := range controlledPods {
 		evictionLimiter := u.evictionFactory.NewPodsEvictionRestriction(livePods)
-		podsForUpdate := u.getPodsForUpdate(filterNonEvictablePods(livePods, evictionLimiter), vpa)
+		podsForUpdate := u.getPodsUpdateOrder(filterNonEvictablePods(livePods, evictionLimiter), vpa)
 
 		for _, pod := range podsForUpdate {
 			if !evictionLimiter.CanEvict(pod) {
@@ -111,18 +130,20 @@ func (u *updater) RunOnce() {
 			}
 		}
 	}
+	timer.ObserveStep("EvictPods")
+	timer.ObserveTotal()
 }
 
-// getPodsForUpdate returns list of pods that should be updated ordered by update priority
-func (u *updater) getPodsForUpdate(pods []*apiv1.Pod, vpa *vpa_types.VerticalPodAutoscaler) []*apiv1.Pod {
-	priorityCalculator := priority.NewUpdatePriorityCalculator(&vpa.Spec.ResourcePolicy, nil, u.recommendationProcessor)
+// getPodsUpdateOrder returns list of pods that should be updated ordered by update priority
+func (u *updater) getPodsUpdateOrder(pods []*apiv1.Pod, vpa *vpa_types.VerticalPodAutoscaler) []*apiv1.Pod {
+	priorityCalculator := priority.NewUpdatePriorityCalculator(vpa.Spec.ResourcePolicy, vpa.Status.Conditions, nil, u.recommendationProcessor)
 	recommendation := vpa.Status.Recommendation
 
 	for _, pod := range pods {
-		priorityCalculator.AddPod(pod, &recommendation, time.Now())
+		priorityCalculator.AddPod(pod, recommendation, time.Now())
 	}
 
-	return priorityCalculator.GetSortedPods()
+	return priorityCalculator.GetSortedPods(u.evictionAdmission)
 }
 
 func filterNonEvictablePods(pods []*apiv1.Pod, evictionRestriciton eviction.PodsEvictionRestriction) []*apiv1.Pod {

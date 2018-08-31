@@ -132,7 +132,7 @@ type NodeGroup interface {
 	Exist() bool
 
 	// Create creates the node group on the cloud provider side. Implementation optional.
-	Create() error
+	Create() (NodeGroup, error)
 
 	// Delete deletes the node group on the cloud provider side.
 	// This will be executed only for autoprovisioned node groups, once their size drops to 0.
@@ -168,6 +168,16 @@ func IsGpuResource(resourceName string) bool {
 	// hack: we assume anything which is not cpu/memory to be a gpu.
 	// we are not getting anything more that a map string->limits from the user
 	return resourceName != ResourceNameCores && resourceName != ResourceNameMemory
+}
+
+// ContainsGpuResources returns true iff given list contains any resource name denoting a gpu type
+func ContainsGpuResources(resources []string) bool {
+	for _, resource := range resources {
+		if IsGpuResource(resource) {
+			return true
+		}
+	}
+	return false
 }
 
 // ResourceLimiter contains limits (max, min) for resources (cores, memory etc.).

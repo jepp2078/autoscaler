@@ -24,7 +24,10 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/aws"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/azure"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/gce"
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/gke"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/kubemark"
+	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/context"
 	"k8s.io/client-go/informers"
 	kubeclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -40,7 +43,7 @@ var AvailableCloudProviders = []string{
 	aws.ProviderName,
 	azure.ProviderName,
 	gce.ProviderNameGCE,
-	gce.ProviderNameGKE,
+	gke.ProviderNameGKE,
 	kubemark.ProviderName,
 	rancher.ProviderName,
 }
@@ -48,49 +51,33 @@ var AvailableCloudProviders = []string{
 // DefaultCloudProvider is GCE.
 const DefaultCloudProvider = gce.ProviderNameGCE
 
-// CloudProviderBuilder builds a cloud provider from all the necessary parameters including the name of a cloud provider e.g. aws, gce
-// and the path to a config file
-type CloudProviderBuilder struct {
-	cloudProviderFlag       string
-	cloudConfig             string
-	clusterName             string
-	autoprovisioningEnabled bool
-	regional                bool
-}
+// NewCloudProvider builds a cloud provider from provided parameters.
+func NewCloudProvider(opts config.AutoscalingOptions) cloudprovider.CloudProvider {
+	glog.V(1).Infof("Building %s cloud provider.", opts.CloudProviderName)
 
-// NewCloudProviderBuilder builds a new builder from static settings
-func NewCloudProviderBuilder(cloudProviderFlag, cloudConfig, clusterName string, autoprovisioningEnabled, regional bool) CloudProviderBuilder {
-	return CloudProviderBuilder{
-		cloudProviderFlag:       cloudProviderFlag,
-		cloudConfig:             cloudConfig,
-		clusterName:             clusterName,
-		autoprovisioningEnabled: autoprovisioningEnabled,
-		regional:                regional,
+	do := cloudprovider.NodeGroupDiscoveryOptions{
+		NodeGroupSpecs:              opts.NodeGroups,
+		NodeGroupAutoDiscoverySpecs: opts.NodeGroupAutoDiscovery,
 	}
-}
+	rl := context.NewResourceLimiterFromAutoscalingOptions(opts)
 
-// Build a cloud provider from static settings contained in the builder and dynamic settings passed via args
-func (b CloudProviderBuilder) Build(discoveryOpts cloudprovider.NodeGroupDiscoveryOptions, resourceLimiter *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
-	glog.V(1).Infof("Building %s cloud provider.", b.cloudProviderFlag)
-	switch b.cloudProviderFlag {
+	switch opts.CloudProviderName {
 	case gce.ProviderNameGCE:
-		return b.buildGCE(discoveryOpts, resourceLimiter, gce.ModeGCE)
-	case gce.ProviderNameGKE:
-		if discoveryOpts.DiscoverySpecified() {
+		return buildGCE(opts, do, rl)
+	case gke.ProviderNameGKE:
+		if do.DiscoverySpecified() {
 			glog.Fatalf("GKE gets nodegroup specification via API, command line specs are not allowed")
 		}
-		if b.autoprovisioningEnabled {
-			return b.buildGCE(discoveryOpts, resourceLimiter, gce.ModeGKENAP)
+		if opts.NodeAutoprovisioningEnabled {
+			return buildGKE(opts, rl, gke.ModeGKENAP)
 		}
-		return b.buildGCE(discoveryOpts, resourceLimiter, gce.ModeGKE)
+		return buildGKE(opts, rl, gke.ModeGKE)
 	case aws.ProviderName:
-		return b.buildAWS(discoveryOpts, resourceLimiter)
+		return buildAWS(opts, do, rl)
 	case azure.ProviderName:
-		return b.buildAzure(discoveryOpts, resourceLimiter)
-	case rancher.ProviderName:
-		return b.buildRancher(discoveryOpts, resourceLimiter)
+		return buildAzure(opts, do, rl)
 	case kubemark.ProviderName:
-		return b.buildKubemark(discoveryOpts, resourceLimiter)
+		return buildKubemark(opts, do, rl)
 	case "":
 		// Ideally this would be an error, but several unit tests of the
 		// StaticAutoscaler depend on this behaviour.
@@ -98,22 +85,22 @@ func (b CloudProviderBuilder) Build(discoveryOpts cloudprovider.NodeGroupDiscove
 		return nil
 	}
 
-	glog.Fatalf("Unknown cloud provider: %s", b.cloudProviderFlag)
+	glog.Fatalf("Unknown cloud provider: %s", opts.CloudProviderName)
 	return nil // This will never happen because the Fatalf will os.Exit
 }
 
-func (b CloudProviderBuilder) buildGCE(do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter, mode gce.GcpCloudProviderMode) cloudprovider.CloudProvider {
+func buildGCE(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
 	var config io.ReadCloser
-	if b.cloudConfig != "" {
+	if opts.CloudConfig != "" {
 		var err error
-		config, err = os.Open(b.cloudConfig)
+		config, err = os.Open(opts.CloudConfig)
 		if err != nil {
-			glog.Fatalf("Couldn't open cloud provider configuration %s: %#v", b.cloudConfig, err)
+			glog.Fatalf("Couldn't open cloud provider configuration %s: %#v", opts.CloudConfig, err)
 		}
 		defer config.Close()
 	}
 
-	manager, err := gce.CreateGceManager(config, mode, b.clusterName, do, b.regional)
+	manager, err := gce.CreateGceManager(config, do, opts.Regional)
 	if err != nil {
 		glog.Fatalf("Failed to create GCE Manager: %v", err)
 	}
@@ -125,13 +112,36 @@ func (b CloudProviderBuilder) buildGCE(do cloudprovider.NodeGroupDiscoveryOption
 	return provider
 }
 
-func (b CloudProviderBuilder) buildAWS(do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
+func buildGKE(opts config.AutoscalingOptions, rl *cloudprovider.ResourceLimiter, mode gke.GcpCloudProviderMode) cloudprovider.CloudProvider {
 	var config io.ReadCloser
-	if b.cloudConfig != "" {
+	if opts.CloudConfig != "" {
 		var err error
-		config, err = os.Open(b.cloudConfig)
+		config, err = os.Open(opts.CloudConfig)
 		if err != nil {
-			glog.Fatalf("Couldn't open cloud provider configuration %s: %#v", b.cloudConfig, err)
+			glog.Fatalf("Couldn't open cloud provider configuration %s: %#v", opts.CloudConfig, err)
+		}
+		defer config.Close()
+	}
+
+	manager, err := gke.CreateGkeManager(config, mode, opts.ClusterName, opts.Regional)
+	if err != nil {
+		glog.Fatalf("Failed to create GKE Manager: %v", err)
+	}
+
+	provider, err := gke.BuildGkeCloudProvider(manager, rl)
+	if err != nil {
+		glog.Fatalf("Failed to create GKE cloud provider: %v", err)
+	}
+	return provider
+}
+
+func buildAWS(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
+	var config io.ReadCloser
+	if opts.CloudConfig != "" {
+		var err error
+		config, err = os.Open(opts.CloudConfig)
+		if err != nil {
+			glog.Fatalf("Couldn't open cloud provider configuration %s: %#v", opts.CloudConfig, err)
 		}
 		defer config.Close()
 	}
@@ -148,14 +158,14 @@ func (b CloudProviderBuilder) buildAWS(do cloudprovider.NodeGroupDiscoveryOption
 	return provider
 }
 
-func (b CloudProviderBuilder) buildAzure(do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
+func buildAzure(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
 	var config io.ReadCloser
-	if b.cloudConfig != "" {
-		glog.Info("Creating Azure Manager using cloud-config file: %v", b.cloudConfig)
+	if opts.CloudConfig != "" {
+		glog.Info("Creating Azure Manager using cloud-config file: %v", opts.CloudConfig)
 		var err error
-		config, err := os.Open(b.cloudConfig)
+		config, err := os.Open(opts.CloudConfig)
 		if err != nil {
-			glog.Fatalf("Couldn't open cloud provider configuration %s: %#v", b.cloudConfig, err)
+			glog.Fatalf("Couldn't open cloud provider configuration %s: %#v", opts.CloudConfig, err)
 		}
 		defer config.Close()
 	} else {
@@ -191,7 +201,7 @@ func (b CloudProviderBuilder) buildRancher(do cloudprovider.NodeGroupDiscoveryOp
 	return provider
 }
 
-func (b CloudProviderBuilder) buildKubemark(do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
+func buildKubemark(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscoveryOptions, rl *cloudprovider.ResourceLimiter) cloudprovider.CloudProvider {
 	externalConfig, err := rest.InClusterConfig()
 	if err != nil {
 		glog.Fatalf("Failed to get kubeclient config for external cluster: %v", err)

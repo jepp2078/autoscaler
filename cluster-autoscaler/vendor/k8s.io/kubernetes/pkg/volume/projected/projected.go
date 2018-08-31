@@ -18,8 +18,6 @@ package projected
 
 import (
 	"fmt"
-	"sort"
-	"strings"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 	"k8s.io/api/core/v1"
@@ -194,16 +192,17 @@ func (s *projectedVolumeMounter) SetUpAt(dir string, fsGroup *int64) error {
 	if err != nil {
 		return err
 	}
-	if err := wrapped.SetUpAt(dir, fsGroup); err != nil {
-		return err
-	}
-	if err := volumeutil.MakeNestedMountpoints(s.volName, dir, *s.pod); err != nil {
-		return err
-	}
 
 	data, err := s.collectData()
 	if err != nil {
 		glog.Errorf("Error preparing data for projected volume %v for pod %v/%v: %s", s.volName, s.pod.Namespace, s.pod.Name, err.Error())
+		return err
+	}
+	if err := wrapped.SetUpAt(dir, fsGroup); err != nil {
+		return err
+	}
+
+	if err := volumeutil.MakeNestedMountpoints(s.volName, dir, *s.pod); err != nil {
 		return err
 	}
 
@@ -225,7 +224,6 @@ func (s *projectedVolumeMounter) SetUpAt(dir string, fsGroup *int64) error {
 		glog.Errorf("Error applying volume ownership settings for group: %v", fsGroup)
 		return err
 	}
-
 	return nil
 }
 
@@ -335,12 +333,6 @@ func (s *projectedVolumeMounter) collectData() (map[string]volumeutil.FileProjec
 	return payload, utilerrors.NewAggregate(errlist)
 }
 
-func sortLines(values string) string {
-	splitted := strings.Split(values, "\n")
-	sort.Strings(splitted)
-	return strings.Join(splitted, "\n")
-}
-
 type projectedVolumeUnmounter struct {
 	*projectedVolume
 }
@@ -362,13 +354,9 @@ func (c *projectedVolumeUnmounter) TearDownAt(dir string) error {
 }
 
 func getVolumeSource(spec *volume.Spec) (*v1.ProjectedVolumeSource, bool, error) {
-	var readOnly bool
-	var volumeSource *v1.ProjectedVolumeSource
-
 	if spec.Volume != nil && spec.Volume.Projected != nil {
-		volumeSource = spec.Volume.Projected
-		readOnly = spec.ReadOnly
+		return spec.Volume.Projected, spec.ReadOnly, nil
 	}
 
-	return volumeSource, readOnly, fmt.Errorf("Spec does not reference a projected volume type")
+	return nil, false, fmt.Errorf("Spec does not reference a projected volume type")
 }

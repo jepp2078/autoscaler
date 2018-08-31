@@ -19,20 +19,20 @@ package core
 import (
 	"time"
 
+	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate"
 	"k8s.io/autoscaler/cluster-autoscaler/clusterstate/utils"
+	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/context"
+	"k8s.io/autoscaler/cluster-autoscaler/expander"
 	"k8s.io/autoscaler/cluster-autoscaler/metrics"
 	ca_processors "k8s.io/autoscaler/cluster-autoscaler/processors"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
-	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/tpu"
 
 	apiv1 "k8s.io/api/core/v1"
-	kube_client "k8s.io/client-go/kubernetes"
-	kube_record "k8s.io/client-go/tools/record"
 
 	"github.com/golang/glog"
 )
@@ -52,7 +52,6 @@ const (
 type StaticAutoscaler struct {
 	// AutoscalingContext consists of validated settings and options for this autoscaler
 	*context.AutoscalingContext
-	kube_util.ListerRegistry
 	// ClusterState for maintaining the state of cluster nodes.
 	clusterStateRegistry    *clusterstate.ClusterStateRegistry
 	startTime               time.Time
@@ -65,21 +64,9 @@ type StaticAutoscaler struct {
 }
 
 // NewStaticAutoscaler creates an instance of Autoscaler filled with provided parameters
-func NewStaticAutoscaler(opts context.AutoscalingOptions, predicateChecker *simulator.PredicateChecker,
-	kubeClient kube_client.Interface, kubeEventRecorder kube_record.EventRecorder, listerRegistry kube_util.ListerRegistry,
-	processors *ca_processors.AutoscalingProcessors) (*StaticAutoscaler, errors.AutoscalerError) {
-	logRecorder, err := utils.NewStatusMapRecorder(kubeClient, opts.ConfigNamespace, kubeEventRecorder, opts.WriteStatusConfigMap)
-	if err != nil {
-		glog.Error("Failed to initialize status configmap, unable to write status events")
-		// Get a dummy, so we can at least safely call the methods
-		// TODO(maciekpytel): recover from this after successful status configmap update?
-		logRecorder, _ = utils.NewStatusMapRecorder(kubeClient, opts.ConfigNamespace, kubeEventRecorder, false)
-	}
-	autoscalingContext, errctx := context.NewAutoscalingContext(opts, predicateChecker, kubeClient, kubeEventRecorder, logRecorder, listerRegistry)
-	if errctx != nil {
-		return nil, errctx
-	}
-
+func NewStaticAutoscaler(opts config.AutoscalingOptions, predicateChecker *simulator.PredicateChecker,
+	autoscalingKubeClients *context.AutoscalingKubeClients, processors *ca_processors.AutoscalingProcessors, cloudProvider cloudprovider.CloudProvider, expanderStrategy expander.Strategy) *StaticAutoscaler {
+	autoscalingContext := context.NewAutoscalingContext(opts, predicateChecker, autoscalingKubeClients, cloudProvider, expanderStrategy)
 	clusterStateConfig := clusterstate.ClusterStateRegistryConfig{
 		MaxTotalUnreadyPercentage: opts.MaxTotalUnreadyPercentage,
 		OkTotalUnreadyCount:       opts.OkTotalUnreadyCount,
@@ -91,7 +78,6 @@ func NewStaticAutoscaler(opts context.AutoscalingOptions, predicateChecker *simu
 
 	return &StaticAutoscaler{
 		AutoscalingContext:      autoscalingContext,
-		ListerRegistry:          listerRegistry,
 		startTime:               time.Now(),
 		lastScaleUpTime:         time.Now(),
 		lastScaleDownDeleteTime: time.Now(),
@@ -99,7 +85,7 @@ func NewStaticAutoscaler(opts context.AutoscalingOptions, predicateChecker *simu
 		scaleDown:               scaleDown,
 		processors:              processors,
 		clusterStateRegistry:    clusterStateRegistry,
-	}, nil
+	}
 }
 
 // cleanUpIfRequired removes ToBeDeleted taints added by a previous run of CA
@@ -145,14 +131,20 @@ func (a *StaticAutoscaler) RunOnce(currentTime time.Time) errors.AutoscalerError
 	}
 	metrics.UpdateDurationFromStart(metrics.UpdateState, stateUpdateStart)
 
-	// Update status information when the loop is done (regardless of reason)
 	defer func() {
+		// Update status information when the loop is done (regardless of reason)
 		if autoscalingContext.WriteStatusConfigMap {
 			status := a.clusterStateRegistry.GetStatus(currentTime)
 			utils.WriteStatusConfigMap(autoscalingContext.ClientSet, autoscalingContext.ConfigNamespace,
 				status.GetReadableString(), a.AutoscalingContext.LogRecorder)
 		}
+
+		err := a.processors.AutoscalingStatusProcessor.Process(a.AutoscalingContext, a.clusterStateRegistry, currentTime)
+		if err != nil {
+			glog.Errorf("AutoscalingStatusProcessor error: %v.", err)
+		}
 	}()
+
 	// Check if there are any nodes that failed to register in Kubernetes
 	// master.
 	unregisteredNodes := a.clusterStateRegistry.GetUnregisteredNodes()
@@ -338,12 +330,7 @@ func (a *StaticAutoscaler) RunOnce(currentTime time.Time) errors.AutoscalerError
 
 			// We want to delete unneeded Node Groups only if there was no recent scale up,
 			// and there is no current delete in progress and there was no recent errors.
-			if a.AutoscalingContext.NodeAutoprovisioningEnabled {
-				err := cleanUpNodeAutoprovisionedGroups(a.AutoscalingContext.CloudProvider, a.AutoscalingContext.LogRecorder)
-				if err != nil {
-					glog.Warningf("Failed to clean up unneeded node groups: %v", err)
-				}
-			}
+			a.processors.NodeGroupManager.RemoveUnneededNodeGroups(autoscalingContext)
 
 			scaleDownStart := time.Now()
 			metrics.UpdateLastTime(metrics.ScaleDown, scaleDownStart)
@@ -363,8 +350,10 @@ func (a *StaticAutoscaler) RunOnce(currentTime time.Time) errors.AutoscalerError
 	return nil
 }
 
-// ExitCleanUp removes status configmap.
+// ExitCleanUp performs all necessary clean-ups when the autoscaler's exiting.
 func (a *StaticAutoscaler) ExitCleanUp() {
+	a.processors.CleanUp()
+
 	if !a.AutoscalingContext.WriteStatusConfigMap {
 		return
 	}

@@ -23,8 +23,10 @@ import (
 	"github.com/golang/glog"
 	kube_flag "k8s.io/apiserver/pkg/util/flag"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/common"
-	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/initialization"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/input/history"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/recommender/routines"
+	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics"
+	metrics_recommender "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/recommender"
 	"k8s.io/client-go/rest"
 	kube_restclient "k8s.io/client-go/rest"
 )
@@ -34,6 +36,7 @@ var (
 	checkpointsGCInterval  = flag.Duration("checkpoints-gc-interval", 10*time.Minute, `How often orphaned checkpoints should be garbage collected`)
 	prometheusAddress      = flag.String("prometheus-address", "", `Where to reach for Prometheus metrics`)
 	storage                = flag.String("storage", "", `Specifies storage mode. Supported values: prometheus, checkpoint (default)`)
+	address                = flag.String("address", ":8942", "The address to expose Prometheus metrics.")
 )
 
 func main() {
@@ -42,8 +45,11 @@ func main() {
 
 	config := createKubeConfig()
 
+	metrics.Initialize(*address)
+	metrics_recommender.Register()
+
 	useCheckpoints := *storage != "prometheus"
-	recommender := initialization.NewRecommender(config, *checkpointsGCInterval, useCheckpoints)
+	recommender := routines.NewRecommender(config, *checkpointsGCInterval, useCheckpoints)
 	if useCheckpoints {
 		recommender.GetClusterStateFeeder().InitFromCheckpoints()
 	} else {

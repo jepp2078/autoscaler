@@ -41,7 +41,7 @@ func NewAutoprovisioningNodeGroupListProcessor() NodeGroupListProcessor {
 func (p *AutoprovisioningNodeGroupListProcessor) Process(context *context.AutoscalingContext, nodeGroups []cloudprovider.NodeGroup, nodeInfos map[string]*schedulercache.NodeInfo,
 	unschedulablePods []*apiv1.Pod) ([]cloudprovider.NodeGroup, map[string]*schedulercache.NodeInfo, error) {
 
-	if !context.AutoscalingOptions.NodeAutoprovisioningEnabled {
+	if !context.NodeAutoprovisioningEnabled {
 		return nodeGroups, nodeInfos, nil
 	}
 
@@ -110,4 +110,8 @@ func addAllMachineTypesForConfig(context *context.AutoscalingContext, systemLabe
 		nodeGroups = append(nodeGroups, nodeGroup)
 	}
 	return nodeGroups
+}
+
+// CleanUp cleans up the processor's internal structures.
+func (p *AutoprovisioningNodeGroupListProcessor) CleanUp() {
 }

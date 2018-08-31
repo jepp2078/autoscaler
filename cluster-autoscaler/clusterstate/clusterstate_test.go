@@ -288,7 +288,7 @@ func TestMissingNodes(t *testing.T) {
 	assert.True(t, ng1Checked)
 }
 
-func TestToManyUnready(t *testing.T) {
+func TestTooManyUnready(t *testing.T) {
 	now := time.Now()
 
 	ng1_1 := BuildTestNode("ng1-1", 1000, 1000)
@@ -669,6 +669,88 @@ func TestScaleUpBackoff(t *testing.T) {
 	assert.True(t, clusterstate.IsClusterHealthy())
 	assert.True(t, clusterstate.IsNodeGroupHealthy("ng1"))
 	assert.True(t, clusterstate.IsNodeGroupSafeToScaleUp("ng1", now))
-	_, found := clusterstate.nodeGroupBackoffInfo["ng1"]
-	assert.False(t, found)
+	assert.False(t, clusterstate.nodeGroupBackoffInfo.IsBackedOff("ng1", now))
+}
+
+func TestGetClusterSize(t *testing.T) {
+	now := time.Now()
+
+	ng1_1 := BuildTestNode("ng1-1", 1000, 1000)
+	SetNodeReadyState(ng1_1, true, now.Add(-time.Minute))
+	ng2_1 := BuildTestNode("ng2-1", 1000, 1000)
+	SetNodeReadyState(ng2_1, true, now.Add(-time.Minute))
+
+	provider := testprovider.NewTestCloudProvider(nil, nil)
+	provider.AddNodeGroup("ng1", 1, 10, 5)
+	provider.AddNodeGroup("ng2", 1, 10, 1)
+
+	provider.AddNode("ng1", ng1_1)
+	provider.AddNode("ng2", ng2_1)
+
+	fakeClient := &fake.Clientset{}
+	fakeLogRecorder, _ := utils.NewStatusMapRecorder(fakeClient, "kube-system", kube_record.NewFakeRecorder(5), false)
+	clusterstate := NewClusterStateRegistry(provider, ClusterStateRegistryConfig{
+		MaxTotalUnreadyPercentage: 10,
+		OkTotalUnreadyCount:       1,
+	}, fakeLogRecorder)
+
+	// There are 2 actual nodes in 2 node groups with target sizes of 5 and 1.
+	clusterstate.UpdateNodes([]*apiv1.Node{ng1_1, ng2_1}, now)
+	currentSize, targetSize := clusterstate.GetClusterSize()
+	assert.Equal(t, 2, currentSize)
+	assert.Equal(t, 6, targetSize)
+
+	// Current size should increase after a new node is added.
+	clusterstate.UpdateNodes([]*apiv1.Node{ng1_1, ng1_1, ng2_1}, now.Add(time.Minute))
+	currentSize, targetSize = clusterstate.GetClusterSize()
+	assert.Equal(t, 3, currentSize)
+	assert.Equal(t, 6, targetSize)
+
+	// Target size should increase after a new node group is added.
+	provider.AddNodeGroup("ng3", 1, 10, 1)
+	clusterstate.UpdateNodes([]*apiv1.Node{ng1_1, ng1_1, ng2_1}, now.Add(2*time.Minute))
+	currentSize, targetSize = clusterstate.GetClusterSize()
+	assert.Equal(t, 3, currentSize)
+	assert.Equal(t, 7, targetSize)
+
+	// Target size should change after a node group changes its target size.
+	for _, ng := range provider.NodeGroups() {
+		ng.(*testprovider.TestNodeGroup).SetTargetSize(10)
+	}
+	clusterstate.UpdateNodes([]*apiv1.Node{ng1_1, ng1_1, ng2_1}, now.Add(3*time.Minute))
+	currentSize, targetSize = clusterstate.GetClusterSize()
+	assert.Equal(t, 3, currentSize)
+	assert.Equal(t, 30, targetSize)
+}
+
+func TestIsNodeStillStarting(t *testing.T) {
+	testCases := []struct {
+		desc           string
+		condition      apiv1.NodeConditionType
+		status         apiv1.ConditionStatus
+		expectedResult bool
+	}{
+		{"unready", apiv1.NodeReady, apiv1.ConditionFalse, true},
+		{"readiness unknown", apiv1.NodeReady, apiv1.ConditionUnknown, true},
+		{"out of disk", apiv1.NodeOutOfDisk, apiv1.ConditionTrue, true},
+		{"network unavailable", apiv1.NodeNetworkUnavailable, apiv1.ConditionTrue, true},
+		{"started", apiv1.NodeReady, apiv1.ConditionTrue, false},
+	}
+
+	now := time.Now()
+	for _, tc := range testCases {
+		t.Run("recent "+tc.desc, func(t *testing.T) {
+			node := BuildTestNode("n1", 1000, 1000)
+			node.CreationTimestamp.Time = now
+			SetNodeCondition(node, tc.condition, tc.status, now.Add(1*time.Minute))
+			assert.Equal(t, tc.expectedResult, isNodeStillStarting(node))
+		})
+		t.Run("long "+tc.desc, func(t *testing.T) {
+			node := BuildTestNode("n1", 1000, 1000)
+			node.CreationTimestamp.Time = now
+			SetNodeCondition(node, tc.condition, tc.status, now.Add(30*time.Minute))
+			// No matter what are the node's conditions, stop considering it not started after long enough.
+			assert.False(t, isNodeStillStarting(node))
+		})
+	}
 }

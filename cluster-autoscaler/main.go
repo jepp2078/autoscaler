@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	ctx "context"
 	"flag"
 	"fmt"
 	"net/http"
@@ -32,12 +33,10 @@ import (
 	kube_flag "k8s.io/apiserver/pkg/util/flag"
 	cloudBuilder "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/builder"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
-	"k8s.io/autoscaler/cluster-autoscaler/context"
 	"k8s.io/autoscaler/cluster-autoscaler/core"
 	"k8s.io/autoscaler/cluster-autoscaler/estimator"
 	"k8s.io/autoscaler/cluster-autoscaler/expander"
 	"k8s.io/autoscaler/cluster-autoscaler/metrics"
-	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/units"
@@ -145,11 +144,12 @@ var (
 	nodeAutoprovisioningEnabled      = flag.Bool("node-autoprovisioning-enabled", false, "Should CA autoprovision node groups when needed")
 	maxAutoprovisionedNodeGroupCount = flag.Int("max-autoprovisioned-node-group-count", 15, "The maximum number of autoprovisioned groups in the cluster.")
 
-	expendablePodsPriorityCutoff = flag.Int("expendable-pods-priority-cutoff", 0, "Pods with priority below cutoff will be expendable. They can be killed without any consideration during scale down and they don't cause scale up. Pods with null priority (PodPriority disabled) are non expendable.")
-	regional                     = flag.Bool("regional", false, "Cluster is regional.")
+	unremovableNodeRecheckTimeout = flag.Duration("unremovable-node-recheck-timeout", 5*time.Minute, "The timeout before we check again a node that couldn't be removed before")
+	expendablePodsPriorityCutoff  = flag.Int("expendable-pods-priority-cutoff", -10, "Pods with priority below cutoff will be expendable. They can be killed without any consideration during scale down and they don't cause scale up. Pods with null priority (PodPriority disabled) are non expendable.")
+	regional                      = flag.Bool("regional", false, "Cluster is regional.")
 )
 
-func createAutoscalingOptions() context.AutoscalingOptions {
+func createAutoscalingOptions() config.AutoscalingOptions {
 	minCoresTotal, maxCoresTotal, err := parseMinMaxFlag(*coresTotal)
 	if err != nil {
 		glog.Fatalf("Failed to parse flags: %v", err)
@@ -167,7 +167,7 @@ func createAutoscalingOptions() context.AutoscalingOptions {
 		glog.Fatalf("Failed to parse flags: %v", err)
 	}
 
-	return context.AutoscalingOptions{
+	return config.AutoscalingOptions{
 		CloudConfig:                      *cloudConfig,
 		CloudProviderName:                *cloudProviderFlag,
 		NodeGroupAutoDiscovery:           *nodeGroupAutoDiscoveryFlag,
@@ -201,6 +201,7 @@ func createAutoscalingOptions() context.AutoscalingOptions {
 		ClusterName:                      *clusterName,
 		NodeAutoprovisioningEnabled:      *nodeAutoprovisioningEnabled,
 		MaxAutoprovisionedNodeGroupCount: *maxAutoprovisionedNodeGroupCount,
+		UnremovableNodeRecheckTimeout:    *unremovableNodeRecheckTimeout,
 		ExpendablePodsPriorityCutoff:     *expendablePodsPriorityCutoff,
 		Regional:                         *regional,
 	}
@@ -248,35 +249,37 @@ func registerSignalHandlers(autoscaler core.Autoscaler) {
 	}()
 }
 
-func run(healthCheck *metrics.HealthCheck) {
-	metrics.RegisterAll()
-	kubeConfig := getKubeConfig()
-	kubeClient := createKubeClient(kubeConfig)
-	kubeEventRecorder := kube_util.CreateEventRecorder(kubeClient)
+func buildAutoscaler() (core.Autoscaler, error) {
+	// Create basic config from flags.
 	autoscalingOptions := createAutoscalingOptions()
-	metrics.UpdateNapEnabled(autoscalingOptions.NodeAutoprovisioningEnabled)
-	predicateCheckerStopChannel := make(chan struct{})
-	predicateChecker, err := simulator.NewPredicateChecker(kubeClient, predicateCheckerStopChannel)
-	if err != nil {
-		glog.Fatalf("Failed to create predicate checker: %v", err)
-	}
-	listerRegistryStopChannel := make(chan struct{})
-	listerRegistry := kube_util.NewListerRegistryWithDefaultListers(kubeClient, listerRegistryStopChannel)
-
+	kubeClient := createKubeClient(getKubeConfig())
 	opts := core.AutoscalerOptions{
 		AutoscalingOptions: autoscalingOptions,
-		PredicateChecker:   predicateChecker,
 		KubeClient:         kubeClient,
-		KubeEventRecorder:  kubeEventRecorder,
-		ListerRegistry:     listerRegistry,
 	}
-	autoscaler, err := core.NewAutoscaler(opts)
+
+	// This metric should be published only once.
+	metrics.UpdateNapEnabled(autoscalingOptions.NodeAutoprovisioningEnabled)
+
+	// Create autoscaler.
+	return core.NewAutoscaler(opts)
+}
+
+func run(healthCheck *metrics.HealthCheck) {
+	metrics.RegisterAll()
+
+	autoscaler, err := buildAutoscaler()
 	if err != nil {
 		glog.Fatalf("Failed to create autoscaler: %v", err)
 	}
+
+	// Register signal handlers for graceful shutdown.
 	registerSignalHandlers(autoscaler)
+
+	// Start updating health check endpoint.
 	healthCheck.StartMonitoring()
 
+	// Autoscale ad infinitum.
 	for {
 		select {
 		case <-time.After(*scanInterval):
@@ -303,9 +306,7 @@ func main() {
 	leaderElection.LeaderElect = true
 
 	bindFlags(&leaderElection, pflag.CommandLine)
-
 	kube_flag.InitFlags()
-
 	healthCheck := metrics.NewHealthCheck(*maxInactivityTimeFlag, *maxFailingTimeFlag)
 
 	glog.V(1).Infof("Cluster Autoscaler %s", ClusterAutoscalerVersion)
@@ -357,13 +358,13 @@ func main() {
 			glog.Fatalf("Unable to create leader election lock: %v", err)
 		}
 
-		kube_leaderelection.RunOrDie(kube_leaderelection.LeaderElectionConfig{
+		kube_leaderelection.RunOrDie(ctx.TODO(), kube_leaderelection.LeaderElectionConfig{
 			Lock:          lock,
 			LeaseDuration: leaderElection.LeaseDuration.Duration,
 			RenewDeadline: leaderElection.RenewDeadline.Duration,
 			RetryPeriod:   leaderElection.RetryPeriod.Duration,
 			Callbacks: kube_leaderelection.LeaderCallbacks{
-				OnStartedLeading: func(_ <-chan struct{}) {
+				OnStartedLeading: func(_ ctx.Context) {
 					// Since we are committing a suicide after losing
 					// mastership, we can safely ignore the argument.
 					run(healthCheck)
@@ -453,8 +454,8 @@ func minMaxFlagString(min, max int64) string {
 	return fmt.Sprintf("%v:%v", min, max)
 }
 
-func parseMultipleGpuLimits(flags MultiStringFlag) ([]context.GpuLimits, error) {
-	parsedFlags := make([]context.GpuLimits, 0, len(flags))
+func parseMultipleGpuLimits(flags MultiStringFlag) ([]config.GpuLimits, error) {
+	parsedFlags := make([]config.GpuLimits, 0, len(flags))
 	for _, flag := range flags {
 		parsedFlag, err := parseSingleGpuLimit(flag)
 		if err != nil {
@@ -465,30 +466,30 @@ func parseMultipleGpuLimits(flags MultiStringFlag) ([]context.GpuLimits, error) 
 	return parsedFlags, nil
 }
 
-func parseSingleGpuLimit(config string) (context.GpuLimits, error) {
-	parts := strings.Split(config, ":")
+func parseSingleGpuLimit(limits string) (config.GpuLimits, error) {
+	parts := strings.Split(limits, ":")
 	if len(parts) != 3 {
-		return context.GpuLimits{}, fmt.Errorf("Incorrect gpu limit specification: %v", config)
+		return config.GpuLimits{}, fmt.Errorf("Incorrect gpu limit specification: %v", limits)
 	}
 	gpuType := parts[0]
 	minVal, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
-		return context.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - min is not integer: %v", config)
+		return config.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - min is not integer: %v", limits)
 	}
 	maxVal, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
-		return context.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - max is not integer: %v", config)
+		return config.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - max is not integer: %v", limits)
 	}
 	if minVal < 0 {
-		return context.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - min is less than 0; %v", config)
+		return config.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - min is less than 0; %v", limits)
 	}
 	if maxVal < 0 {
-		return context.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - max is less than 0; %v", config)
+		return config.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - max is less than 0; %v", limits)
 	}
 	if minVal > maxVal {
-		return context.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - min is greater than max; %v", config)
+		return config.GpuLimits{}, fmt.Errorf("Incorrect gpu limit - min is greater than max; %v", limits)
 	}
-	parsedGpuLimits := context.GpuLimits{
+	parsedGpuLimits := config.GpuLimits{
 		GpuType: gpuType,
 		Min:     minVal,
 		Max:     maxVal,

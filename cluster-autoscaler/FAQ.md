@@ -79,6 +79,10 @@ Cluster Autoscaler decreases the size of the cluster when some nodes are consist
 * Pods with local storage. *
 * Pods that cannot be moved elsewhere due to various constraints (lack of resources, non-matching node selectors or affinity,
 matching anti-affinity, etc)
+* Pods that have the following annotation set:
+```
+"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"
+```
 
 <sup>*</sup>Unless the pod has the following annotation (supported in CA 1.0.3 or later):
 ```
@@ -87,19 +91,7 @@ matching anti-affinity, etc)
 
 ### Which version on Cluster Autoscaler should I use in my cluster?
 
-We strongly recommend using Cluster Autoscaler with version for which it was meant. Usually, we don't
-do ANY cross version testing so if you put the newest Cluster Autoscaler on an old cluster
-there is a big chance that it won't work as expected.
-
-| Kubernetes Version  | CA Version   |
-|--------|--------|
-| 1.8.X  | 1.0.X  |
-| 1.7.X  | 0.6.X  |
-| 1.6.X  | 0.5.X, 0.6.X<sup>*</sup>  |
-| 1.5.X  | 0.4.X  |
-| 1.4.X  | 0.3.X  |
-
-<sup>*</sup>Cluster Autoscaler 0.5.X is the official version shipped with k8s 1.6. We've done some basic tests using k8s 1.6 / CA 0.6 and we're not aware of any problems with this setup. However, CA internally simulates k8s scheduler and using different versions of scheduler code can lead to subtle issues.
+See [Cluster Autoscaler Releases](https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler#releases)
 
 ### Is Cluster Autoscaler an Alpha, Beta or GA product?
 
@@ -312,8 +304,8 @@ Below solution works since version 1.1 (to be shipped with Kubernetes 1.9).
 Overprovisioning can be configured using deployment running pause pods with very low assigned
 priority (see [Priority Preemption](https://kubernetes.io/docs/concepts/configuration/pod-priority-preemption/))
 which keeps resources that can be used by other pods. If there is not enough resources then pause
-pods are premmpted and new pods take their place. Next pause pods become unschedulable and force CA
- to scale up the cluster.
+pods are preempted and new pods take their place. Next pause pods become unschedulable and force CA
+to scale up the cluster.
 
 The size of overprovisioned resources can be controlled by changing the size of pause pods and the
 number of replicas. This way you can configure static size of overprovisioning resources (i.e. 2
@@ -508,7 +500,7 @@ From 0.5 CA (K8S 1.6) respects PDBs. Before starting to delete a node, CA makes 
 
 ### Does CA respect GracefulTermination in scale-down?
 
-CA, from version 1.0, gives pods at most 10 minutes graceful termination time. If the pod is not stopped within these 10 min then the node is deleted anyway. Earlier versions of CA gave 1 minute or didn't respect graceful termination at all.
+CA, from version 1.0, gives pods at most 10 minutes graceful termination time by default (configurable via `--max-graceful-termination-sec`). If the pod is not stopped within these 10 min then the node is deleted anyway. Earlier versions of CA gave 1 minute or didn't respect graceful termination at all.
 
 ### How does CA deal with unready nodes?
 
@@ -828,7 +820,7 @@ the following hack makes the things easier to handle:
 
 1. Create a new `$GOPATH` directory.
 2. Get `k8s.io/kubernetes` and `k8s.io/autoscaler` source code (via `git clone` or `go get`).
-3. Make sure that you use the correct branch/tag in `k8s.io/kubernetes`(Note: please refer cluster-autoscaler/kubernetes.sync for the right commit). For example, regular dev updates should be done against `k8s.io/kubernetes` HEAD, while updates in CA release branches should be done
+3. Make sure that you use the correct branch/tag in `k8s.io/kubernetes`(Note: please refer cluster-autoscaler/kubernetes.sync for the last sync commit). For example, regular dev updates should be done against `k8s.io/kubernetes` HEAD, while updates in CA release branches should be done
    against the latest release tag of the corresponding `k8s.io/kubernetes` branch.
 4. Do `godep restore` in `k8s.io/kubernetes`.
 5. Remove Godeps and vendor from `k8s.io/autoscaler/cluster-autoscaler`.
@@ -837,5 +829,7 @@ the following hack makes the things easier to handle:
    `k8s.io/kubernetes/staging` and remove all vendor directories from your gopath.
 8. Check if everything compiles with `go test ./...` in `k8s.io/autoscaler/cluster-autoscaler`.
 9. `godep save ./...` in `k8s.io/autoscaler/cluster-autoscaler`,
-10. Send a PR with 2 commits - one that covers `Godep` and `vendor/`, and the other one with all
+10. Update `kubernetes.sync` with the commit used to perform this update (output
+    of running `git show --summary` in `k8s.io/kubernetes`.)
+11. Send a PR with 2 commits - one that covers `Godep` and `vendor/`, and the other one with all
    required real code changes.

@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/watch"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/poc.autoscaling.k8s.io/v1alpha1"
 	vpa_clientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
 	vpa_api "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned/typed/poc.autoscaling.k8s.io/v1alpha1"
@@ -40,7 +41,7 @@ import (
 	v1lister "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
-	resourceclient "k8s.io/metrics/pkg/client/clientset_generated/clientset/typed/metrics/v1beta1"
+	resourceclient "k8s.io/metrics/pkg/client/clientset/versioned/typed/metrics/v1beta1"
 )
 
 // ClusterStateFeeder can update state of ClusterState object.
@@ -68,13 +69,14 @@ type ClusterStateFeeder interface {
 // NewClusterStateFeeder creates new ClusterStateFeeder with internal data providers, based on kube client config and a historyProvider.
 func NewClusterStateFeeder(config *rest.Config, clusterState *model.ClusterState) ClusterStateFeeder {
 	kubeClient := kube_client.NewForConfigOrDie(config)
-	podLister, observer := newPodClients(kubeClient)
+	oomObserver := oom.NewObserver()
+	podLister := newPodClients(kubeClient, &oomObserver)
+	watchEvictionEventsWithRetries(kubeClient, &oomObserver)
 	return &clusterStateFeeder{
 		coreClient:          kubeClient.CoreV1(),
 		specClient:          spec.NewSpecClient(podLister),
 		metricsClient:       newMetricsClient(config),
-		oomObserver:         observer,
-		vpaClient:           vpa_clientset.NewForConfigOrDie(config).PocV1alpha1(),
+		oomObserver:         &oomObserver,
 		vpaCheckpointClient: vpa_clientset.NewForConfigOrDie(config).PocV1alpha1(),
 		vpaLister:           vpa_api_util.NewAllVpasLister(vpa_clientset.NewForConfigOrDie(config), make(chan struct{})),
 		clusterState:        clusterState,
@@ -86,22 +88,55 @@ func newMetricsClient(config *rest.Config) metrics.MetricsClient {
 	return metrics.NewMetricsClient(metricsGetter)
 }
 
-// Creates clients watching pods: PodLister (listing only not terminated pods) and OOM observer.
-func newPodClients(kubeClient kube_client.Interface) (v1lister.PodLister, *oom.Observer) {
+func watchEvictionEventsWithRetries(kubeClient kube_client.Interface, observer *oom.Observer) {
+	go func() {
+		options := metav1.ListOptions{
+			FieldSelector: "reason=Evicted",
+		}
+
+		for {
+			watchInterface, err := kubeClient.CoreV1().Events("").Watch(options)
+			if err != nil {
+				glog.Errorf("Cannot initialize watching events. Reason %v", err)
+				continue
+			}
+			watchEvictionEvents(watchInterface.ResultChan(), observer)
+		}
+	}()
+}
+
+func watchEvictionEvents(evictedEventChan <-chan watch.Event, observer *oom.Observer) {
+	for {
+		evictedEvent, ok := <-evictedEventChan
+		if !ok {
+			glog.V(3).Infof("Eviction event chan closed")
+			return
+		}
+		if evictedEvent.Type == watch.Added {
+			evictedEvent, ok := evictedEvent.Object.(*apiv1.Event)
+			if !ok {
+				continue
+			}
+			observer.OnEvent(evictedEvent)
+		}
+	}
+}
+
+// Creates clients watching pods: PodLister (listing only not terminated pods).
+func newPodClients(kubeClient kube_client.Interface, resourceEventHandler cache.ResourceEventHandler) v1lister.PodLister {
 	selector := fields.ParseSelectorOrDie("status.phase!=" + string(apiv1.PodPending))
 	podListWatch := cache.NewListWatchFromClient(kubeClient.CoreV1().RESTClient(), "pods", apiv1.NamespaceAll, selector)
-	oomObserver := oom.NewObserver()
 	indexer, controller := cache.NewIndexerInformer(
 		podListWatch,
 		&apiv1.Pod{},
 		time.Hour,
-		&oomObserver,
+		resourceEventHandler,
 		cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc},
 	)
 	podLister := v1lister.NewPodLister(indexer)
 	stopCh := make(chan struct{})
 	go controller.Run(stopCh)
-	return podLister, &oomObserver
+	return podLister
 }
 
 type clusterStateFeeder struct {
@@ -109,7 +144,6 @@ type clusterStateFeeder struct {
 	specClient          spec.SpecClient
 	metricsClient       metrics.MetricsClient
 	oomObserver         *oom.Observer
-	vpaClient           vpa_api.VerticalPodAutoscalersGetter
 	vpaCheckpointClient vpa_api.VerticalPodAutoscalerCheckpointsGetter
 	vpaLister           vpa_lister.VerticalPodAutoscalerLister
 	clusterState        *model.ClusterState
@@ -255,14 +289,12 @@ func (feeder *clusterStateFeeder) LoadPods() {
 		glog.V(3).Infof("SimplePodSpec #%v: %+v", n, spec)
 		pods[spec.ID] = spec
 	}
-	/* TODO: Once we start collecting aggregated history of pods usage in
-	a separate object, we can be deleting terminated pods from the model.
 	for key := range feeder.clusterState.Pods {
 		if _, exists := pods[key]; !exists {
 			glog.V(3).Infof("Deleting Pod %v", key)
 			feeder.clusterState.DeletePod(key)
 		}
-	}*/
+	}
 	for _, pod := range pods {
 		feeder.clusterState.AddOrUpdatePod(pod.ID, pod.PodLabels, pod.Phase)
 		for _, container := range pod.Containers {
@@ -298,7 +330,7 @@ Loop:
 				},
 				ContainerName: oomInfo.Container,
 			}
-			feeder.clusterState.RecordOOM(container, oomInfo.Timestamp, model.ResourceAmount(oomInfo.MemoryRequest.Value()))
+			feeder.clusterState.RecordOOM(container, oomInfo.Timestamp, model.ResourceAmount(oomInfo.Memory.Value()))
 		default:
 			break Loop
 		}
